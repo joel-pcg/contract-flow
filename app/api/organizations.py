@@ -81,36 +81,35 @@
     - Role updates
 """
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlmodel import Session, select
-from uuid import UUID
-from typing import List, Optional, Tuple
-from fastapi.responses import JSONResponse
-
-from ..core.permission import require_permission, Permission
-from ..core.security import get_current_user, get_session, get_current_user_with_org
-from ..schemas.organization import (
-    AdminDashboardResponse, 
-    OrganizationRead, 
-    OrganizationDetailResponse, 
-    OrganizationSettings,
-    OrganizationSettingsUpdate,
-    SecuritySettings,
-    NotificationSettings,
-    StorageSettings,
-    RoleUpdate,
-    DashboardMemberInfo,
-    DashboardMetrics
-)
-from ..schemas.invitations import InvitationResponse, InvitationCreate
-from ..models.users import User
-from ..models.invitations import Invitation
-from ..models.organization import Organization, OrganizationUser, OrganizationRole
-from ..services.email_services import email_service
-
 import secrets
 from datetime import datetime, timedelta
+from typing import List, Optional, Tuple
+from uuid import UUID
 
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from sqlmodel import Session, select
+
+from ..core.permission import Permission, require_permission
+from ..core.security import get_current_user, get_current_user_with_org, get_session
+from ..models.invitations import Invitation
+from ..models.organization import Organization, OrganizationRole, OrganizationUser
+from ..models.users import User
+from ..schemas.invitations import InvitationCreate, InvitationResponse
+from ..schemas.organization import (
+    AdminDashboardResponse,
+    DashboardMemberInfo,
+    DashboardMetrics,
+    NotificationSettings,
+    OrganizationDetailResponse,
+    OrganizationRead,
+    OrganizationSettings,
+    OrganizationSettingsUpdate,
+    RoleUpdate,
+    SecuritySettings,
+    StorageSettings,
+)
+from ..services.email_services import email_service
 
 router = APIRouter()
 
@@ -349,7 +348,7 @@ async def create_invitation(
     )
 
 
-@router.get('{org_id}/invitations', response_model=List[InvitationResponse])
+@router.get('/{org_id}/invitations', response_model=List[InvitationResponse])
 @require_permission(Permission.INVITE_MEMBERS)
 async def list_pending_invitations(
     org_id: UUID,
@@ -393,7 +392,6 @@ async def list_pending_invitations(
 async def cancel_invitation(
     org_id: UUID,
     invitation_id: UUID,
-    user_id: UUID,
     background_task: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session)
@@ -405,7 +403,6 @@ async def cancel_invitation(
     Args:
         org_id (UUID): Organization identifier
         invitation_id (UUID): Invitation identifier
-        user_id (UUID): User identifier
         background_task (BackgroundTasks): FastAPI background task handler
         current_user (User): Currently authenticated user
         session (Session): Database session
@@ -417,7 +414,6 @@ async def cancel_invitation(
         HTTPException: If invitation not found or error during cancellation
     """
     invitation = session.get(Invitation, invitation_id)
-    user = session.get(User, user_id)
     organization = session.get(Organization, org_id)
     if not invitation or invitation.organization_id != org_id:
         raise HTTPException(
@@ -426,11 +422,13 @@ async def cancel_invitation(
         )
 
     try:
+        # Store email before deleting invitation
+        invited_email = invitation.email
         session.delete(invitation)
 
         background_task.add_task(
             email_service.send_invitation_cancelled_email,
-            to_email=user.email,
+            to_email=invited_email,
             organization_name=organization.name
         )
         session.commit()

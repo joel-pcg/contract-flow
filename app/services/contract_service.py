@@ -1,18 +1,48 @@
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
-from sqlmodel import Session, select
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
-from app.models.contract import (
-    Contract, ContractStatus, ContractVersion, ContractParty
-)
+
+from sqlmodel import Session, func, select
+
+from app.core.permission import ROLE_PERMISSIONS, Permission
+from app.models.contract import Contract, ContractParty, ContractStatus, ContractVersion
 from app.models.organization import OrganizationUser
 from app.schemas.contract import ContractCreate, ContractUpdate, ContractVersionCreate
-from app.core.permission import ROLE_PERMISSIONS, Permission
-from app.core.template_engine import render_template_string, create_jinja_env
-import logging
 from app.services.pdf_service import generate_pdf
+from app.utils.utils import ensure_timezone_aware
 
 logger = logging.getLogger(__name__)
+
+
+# =====================================
+# CUSTOM EXCEPTIONS
+# =====================================
+
+class ContractServiceError(Exception):
+    """Base exception for contract service errors."""
+    pass
+
+
+class ContractNotFoundError(ContractServiceError):
+    """Raised when a contract is not found."""
+    pass
+
+
+class ContractPermissionError(ContractServiceError):
+    """Raised when user lacks permission for contract operation."""
+    pass
+
+
+class ContractStatusError(ContractServiceError):
+    """Raised when contract status transition is invalid."""
+    pass
+
+
+class ContractValidationError(ContractServiceError):
+    """Raised when contract data validation fails."""
+    pass
+
 
 def create_contract(db: Session, user_id: UUID, contract_data: ContractCreate) -> Contract:
     """
@@ -95,21 +125,24 @@ def update_contract(
     contract_data: ContractUpdate
 ) -> Contract:
     """Update contract metadata (not content)."""
-    # [CHALLENGE 16] Implement contract update
-    # Requirements:
-    # - Get contract by ID
+    # Get contract by ID
     contract = db.exec(select(Contract).where(Contract.id == contract_id)).one_or_none()
     if not contract:
-        raise ValueError("Contract not found")
-    # - Update fields from contract_data if provided
+        raise ContractNotFoundError(f"Contract {contract_id} not found")
+    
+    # Update fields from contract_data if provided
     for field, value in contract_data.model_dump().items():
         if value is not None:
             setattr(contract, field, value)
-    # - Validate status transition if status is changing
+    
+    # Validate status transition if status is changing
     if contract.status != contract_data.status:
         if contract.status == ContractStatus.ACTIVE and contract_data.status != ContractStatus.ACTIVE:
-            raise ValueError("Cannot change status from ACTIVE to non-ACTIVE")
-    # - Update activity tracking fields
+            raise ContractStatusError(
+                f"Cannot change status from {contract.status.value} to {contract_data.status.value}"
+            )
+    
+    # Update activity tracking fields
     contract.last_activity_by_id = user_id
     contract.last_activity = datetime.now(timezone.utc)
     db.add(contract)
@@ -131,7 +164,7 @@ def create_contract_version(
     # - Get contract by ID
     contract = db.exec(select(Contract).where(Contract.id == contract_id)).one_or_none()
     if not contract:
-        raise ValueError("Contract not found")
+        raise ContractNotFoundError(f"Contract {contract_id} not found")
     # - Create new version with incremented version number
     version   = ContractVersion(
         contract_id=contract_id,
@@ -250,12 +283,24 @@ def get_user_contracts(
             org_query = org_query.where(condition)
     
     # Combine queries with UNION to get unique contract IDs
-    contract_ids_query = owned_query.union(party_query)
-    if org_query:
-        contract_ids_query = contract_ids_query.union(org_query)
+    # Collect all contract IDs from different sources
+    contract_ids = set()
     
-    # Get the contract IDs
-    contract_ids = [row[0] for row in db.exec(contract_ids_query).all()]
+    # Get IDs from owned contracts
+    owned_ids = db.exec(owned_query).all()
+    contract_ids.update(owned_ids)
+    
+    # Get IDs from party contracts  
+    party_ids = db.exec(party_query).all()
+    contract_ids.update(party_ids)
+    
+    # Get IDs from organization contracts
+    if org_query is not None:
+        org_ids = db.exec(org_query).all()
+        contract_ids.update(org_ids)
+    
+    # Convert to list
+    contract_ids = list(contract_ids)
     
     # Now fetch the actual Contract objects
     if not contract_ids:
@@ -280,307 +325,371 @@ def get_user_contracts(
     return contracts
  
 
-def render_contract_html(content: Dict[str, Any], contract: Contract) -> str:
+def get_contract_data(db: Session, contract_id: UUID) -> Dict[str, Any]:
     """
-    Render contract content as HTML.
+    Get complete contract data for API responses.
+    Clean separation: Backend provides data, Frontend handles presentation.
+    
+    Args:
+        db: Database session
+        contract_id: Contract identifier
+        
+    Returns:
+        Complete contract data with content and metadata
+        
+    Raises:
+        ValueError: If contract not found
+    """
+    contract, content = get_contract_with_current_content(db, contract_id)
+    
+    if not contract:
+        raise ContractNotFoundError(f"Contract {contract_id} not found")
+    
+    return {
+        "contract": contract_to_api_response(contract, content),
+        "content": content or {},
+        "parties": [
+            {
+                "id": str(party.id),
+                "name": _get_party_display_name(party),
+                "email": _get_party_email(party),
+                "type": party.party_type.value,
+                "signature_required": party.signature_required,
+                "signature_date": party.signature_date.isoformat() if party.signature_date else None,
+                "signed": party.signature_date is not None
+            }
+            for party in contract.parties
+        ],
+        "metadata": {
+            "version": contract.current_version,
+            "status": contract.status.value,
+            "effective_date": contract.effective_date.isoformat() if contract.effective_date else None,
+            "expiration_date": contract.expiration_date.isoformat() if contract.expiration_date else None,
+            "created_at": contract.created_at.isoformat(),
+            "last_activity": contract.last_activity.isoformat() if contract.last_activity else None
+        }
+    }
+
+
+def _get_party_display_name(party: ContractParty) -> str:
+    """Get the display name for a contract party."""
+    if party.user and party.user.full_name:
+        return party.user.full_name
+    elif party.user:
+        return party.user.email
+    elif party.organization:
+        return party.organization.name
+    elif party.external_name:
+        return party.external_name
+    else:
+        return party.external_email or "Unknown Party"
+
+
+def _get_party_email(party: ContractParty) -> str:
+    """Get the email for a contract party."""
+    if party.user:
+        return party.user.email
+    elif party.external_email:
+        return party.external_email
+    else:
+        return ""
+
+def generate_contract_pdf(content: Dict[str, Any], contract: Contract, db: Session = None) -> str:
+    """
+    Generate PDF from contract content with real signatures included.
     
     Args:
         content: Contract content
         contract: Contract model
-        
-    Returns:
-        HTML representation of contract
-    """
-    try:
-        # Format party information
-        parties = []
-        for party in contract.parties:
-            if party.user:
-                parties.append({"name": party.user.full_name if party.user.full_name else party.user.email})
-            elif party.organization:
-                parties.append({"name": party.organization.name})
-            else:
-                parties.append({"name": party.external_name if party.external_name else party.external_email})
-        
-        # Render content sections
-        content_html = render_content_sections(content.get("sections", []))
-        
-        # Create Jinja2 environment
-        env = create_jinja_env()
-        
-        # Load template
-        try:
-            template = env.get_template("contract.html")
-            
-            # Render template
-            html = template.render(
-                contract=contract,
-                parties=parties,
-                content_html=content_html
-            )
-        except Exception as e:
-            # Fallback to inline template if file not found
-            logger.warning(f"Contract template file not found, using fallback: {str(e)}")
-            
-            # Create template for contract
-            contract_template_str = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="utf-8">
-                <title>{{ contract.title }}</title>
-                <style>
-                    body { 
-                        font-family: Arial, sans-serif; 
-                        margin: 40px;
-                        line-height: 1.5;
-                        color: #333;
-                    }
-                    .header { 
-                        text-align: center; 
-                        margin-bottom: 30px;
-                        border-bottom: 1px solid #eee;
-                        padding-bottom: 20px;
-                    }
-                    .title { 
-                        font-size: 24px; 
-                        font-weight: bold;
-                        margin-bottom: 10px;
-                    }
-                    .parties { 
-                        margin: 20px 0;
-                        padding: 15px;
-                        background-color: #f9f9f9;
-                        border-radius: 5px;
-                    }
-                    .party {
-                        margin: 5px 0;
-                        padding: 5px 0;
-                    }
-                    .content { 
-                        margin: 20px 0;
-                    }
-                    .section {
-                        margin-bottom: 20px;
-                    }
-                    .section h2 {
-                        border-bottom: 1px solid #eee;
-                        padding-bottom: 5px;
-                    }
-                    .subsection {
-                        margin-left: 20px;
-                        margin-bottom: 15px;
-                    }
-                    .subsection h3 {
-                        font-size: 16px;
-                    }
-                    .signatures { 
-                        margin-top: 50px;
-                        display: flex;
-                        justify-content: space-between;
-                    }
-                    .signature-block {
-                        width: 45%;
-                        border-top: 1px solid #000;
-                        padding-top: 5px;
-                        margin-top: 70px;
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="header">
-                    <div class="title">{{ contract.title }}</div>
-                    <div class="date">Effective Date: {{ contract.effective_date }}</div>
-                </div>
-                
-                <div class="parties">
-                    <h3>Parties to this Agreement:</h3>
-                    {% for party in parties %}
-                    <div class='party'>{{ party.name }}</div>
-                    {% endfor %}
-                </div>
-                
-                <div class="content">
-                    {{ content_html|safe }}
-                </div>
-                
-                <div class="signatures">
-                    {% for party in parties %}
-                    <div class="signature-block">
-                        <div>{{ party.name }}</div>
-                        <div>Date: ________________</div>
-                    </div>
-                    {% endfor %}
-                </div>
-            </body>
-            </html>
-            """
-            
-            # Render template
-            html = render_template_string(
-                contract_template_str, 
-                contract=contract,
-                parties=parties,
-                content_html=content_html
-            )
-        
-        return html
-    except Exception as e:
-        logger.error(f"Error rendering contract HTML: {str(e)}")
-        raise ValueError(f"Failed to render contract HTML: {str(e)}")
-
-
-def render_content_sections(sections: List[Dict[str, Any]]) -> str:
-    """
-    Render contract content sections as HTML.
-    
-    Args:
-        sections: List of content sections
-        
-    Returns:
-        HTML representation of content sections
-    """
-    try:
-        # Create Jinja2 environment
-        env = create_jinja_env()
-        
-        # Load template
-        try:
-            template = env.get_template("contract_sections.html")
-            
-            # Render template
-            html = template.render(sections=sections)
-        except Exception as e:
-            # Fallback to inline template if file not found
-            logger.warning(f"Contract sections template file not found, using fallback: {str(e)}")
-            
-            # Create template for sections
-            section_template_str = """
-            {% for section in sections %}
-            <div class="section">
-                <h2>{{ section.title }}</h2>
-                <div class="section-content">{{ section.text }}</div>
-                
-                {% if section.subsections %}
-                <div class="subsections">
-                    {% for subsection in section.subsections %}
-                    <div class="subsection">
-                        <h3>{{ subsection.title }}</h3>
-                        <div class="subsection-content">{{ subsection.text }}</div>
-                    </div>
-                    {% endfor %}
-                </div>
-                {% endif %}
-            </div>
-            {% endfor %}
-            """
-            
-            # Render template
-            html = render_template_string(section_template_str, sections=sections)
-        
-        return html
-    except Exception as e:
-        logger.error(f"Error rendering content sections: {str(e)}")
-        return "<p>Error rendering content sections</p>"
-
-def generate_contract_pdf(content: Dict[str, Any], contract: Contract) -> str:
-    """
-    Generate PDF from contract content.
-    
-    Args:
-        content: Contract content
-        contract: Contract model
+        db: Database session (required for signature data)
         
     Returns:
         Path to generated PDF file
     """
-    # First render the contract as HTML
-    html_content = render_contract_html(content, contract)
-    
-    # Generate PDF using the pdf_service
-    filename = f"contract_{contract.id}_{contract.current_version}.pdf"
-    output_path = f"storage/contracts/{contract.id}/{filename}"
-    
-    # Add custom CSS for contracts if needed
-    css_content = """
-    body {
-        font-family: Arial, sans-serif;
-        font-size: 12pt;
-        line-height: 1.5;
-        margin: 2cm;
-    }
-    h1 {
-        font-size: 18pt;
+    try:
+        # Get signatures for this contract if db session provided
+        signatures_data = {}
+        if db:
+            from app.models.signature import ContractSignature
+            signatures = db.exec(
+                select(ContractSignature).where(ContractSignature.contract_id == contract.id)
+            ).all()
+            
+            # Create mapping: party_email -> signature_info
+            for signature in signatures:
+                signatures_data[signature.party_email] = {
+                    'signed_at': signature.signed_at,
+                    'signature_method': signature.signature_method,
+                    'signature_data': signature.signature_data,
+                    'ip_address': signature.ip_address
+                }
+        
+        # Create PDF HTML with signature data
+        html_content = _create_pdf_html(contract, content, signatures_data)
+        
+        # Generate filename and path
+        status_suffix = "_signed" if signatures_data else "_draft"
+        filename = f"contract_{contract.id}_{contract.current_version}{status_suffix}.pdf"
+        output_path = f"storage/contracts/{contract.id}/{filename}"
+        
+        # PDF-optimized CSS with signature styling
+        css_content = """
+        body {
+            font-family: 'Times New Roman', serif;
+            font-size: 11pt;
+            line-height: 1.4;
+            margin: 2.5cm;
+            color: #000;
+        }
+        .header {
         text-align: center;
         margin-bottom: 2cm;
-    }
-    h2 {
-        font-size: 14pt;
-        margin-top: 1.5cm;
+            border-bottom: 2px solid #000;
+            padding-bottom: 1cm;
+        }
+        .title {
+            font-size: 16pt;
+            font-weight: bold;
         margin-bottom: 0.5cm;
     }
+        .contract-status {
+            font-size: 10pt;
+            margin-top: 0.5cm;
+            font-weight: bold;
+        }
+        .parties {
+            margin: 1.5cm 0;
+            page-break-inside: avoid;
+        }
+        .party {
+            margin: 0.3cm 0;
+            font-size: 10pt;
+        }
     .section {
-        margin-bottom: 1cm;
-    }
-    .section-content {
-        text-align: justify;
-    }
-    .footer {
-        position: fixed;
-        bottom: 0;
-        width: 100%;
-        text-align: center;
-        font-size: 9pt;
-        color: #666;
-    }
-    @page {
-        @bottom-center {
-            content: "Página " counter(page) " de " counter(pages);
+            margin-bottom: 1.2cm;
+            page-break-inside: avoid;
+        }
+        .section h2 {
+            font-size: 12pt;
+            font-weight: bold;
+            margin-bottom: 0.5cm;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 0.2cm;
+        }
+        .signatures {
+            margin-top: 5cm;
+            page-break-inside: avoid;
+        }
+        .signatures h3 {
+            font-size: 16pt;
+            margin-bottom: 3cm;
+            text-align: center;
+            border-bottom: 2px solid #000;
+            padding-bottom: 0.5cm;
+            letter-spacing: 1px;
+        }
+        .signature-block {
+            display: inline-block;
+            width: 40%;
+            margin: 1.5cm 5% 3cm 0;
+            page-break-inside: avoid;
+            vertical-align: top;
+        }
+        .signature-area {
+            height: 4cm;
+            position: relative;
+            margin-bottom: 1cm;
+        }
+        .handwritten-signature {
+            font-family: 'Brush Script MT', cursive, 'Dancing Script', serif;
+            font-size: 18pt;
+            color: #1a472a;
+            margin-bottom: 0.5cm;
+            text-align: center;
+            font-weight: bold;
+            transform: rotate(-2deg);
+            margin-top: 1cm;
+        }
+        .signature-line {
+            border-bottom: 1.5px solid #000;
+            height: 1px;
+            margin: 1cm 0 0.3cm 0;
+        }
+        .signature-details {
+            text-align: center;
+            margin-top: 0.5cm;
+        }
+        .signer-name {
+            font-size: 11pt;
+            font-weight: bold;
+            margin-bottom: 0.2cm;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .signature-date {
             font-size: 9pt;
             color: #666;
+            font-style: italic;
         }
-        @top-right {
-            content: "Contrato: " string(contract-title);
-            font-size: 9pt;
-            color: #666;
+        .verification-footer {
+            margin-top: 6cm;
+            padding: 0.3cm 0;
+            border-top: 0.5px solid #ddd;
+            page-break-inside: avoid;
         }
-    }
-    h1 {
-        string-set: contract-title content();
-    }
-    """
-    
-    # Add metadata for the PDF
-    metadata = {
-        'title': f"Contract: {contract.title}",
-        'subject': f"Contract ID: {contract.id}, Version: {contract.current_version}",
-        'keywords': f"contract, {contract.template_type}, {contract.status}",
-        'creator': 'Contract Management System',
-    }
-    
-    try:
-        # Generate PDF using the pdf_service
+        .verification-info {
+            font-size: 8pt;
+            color: #999;
+            text-align: center;
+            font-style: italic;
+            letter-spacing: 0.3px;
+        }
+        @page {
+            @bottom-center {
+                content: "Page " counter(page) " of " counter(pages);
+                font-size: 9pt;
+            }
+        }
+        """
+        
+        # Generate PDF
         pdf_path = generate_pdf(
             html_content=html_content,
             output_path=output_path,
-            css_content=css_content,
-            metadata=metadata
+            css_content=css_content
         )
         
-        # Update the contract version with the PDF path
-        # This is optional but useful for future reference
-        if hasattr(contract, 'versions') and contract.versions:
-            current_version = next(
-                (v for v in contract.versions if v.version == contract.current_version),
-                None
-            )
-            if current_version:
-                current_version.pdf_path = pdf_path
-        
+        logger.info(f"Contract PDF generated: {pdf_path}")
         return pdf_path
+        
     except Exception as e:
         logger.error(f"Error generating contract PDF: {str(e)}")
-        raise ValueError(f"Failed to generate contract PDF: {str(e)}")
+        raise ContractServiceError(f"Failed to generate contract PDF: {str(e)}")
+
+
+def _create_pdf_html(contract: Contract, content: Dict[str, Any], signatures_data: Dict[str, Any] = None) -> str:
+    """
+    Create clean HTML specifically for PDF generation with real signatures.
+    
+    Args:
+        contract: Contract model
+        content: Contract content
+        signatures_data: Dict mapping party_email -> signature_info
+    """
+    
+    signatures_data = signatures_data or {}
+    
+    # Build sections HTML
+    sections_html = ""
+    for section in content.get("sections", []):
+        sections_html += f"""
+        <div class="section">
+            <h2>{section.get('title', 'Section')}</h2>
+            <div class="section-content">{section.get('text', '')}</div>
+        </div>
+        """
+    
+    # Build signatures HTML - showing real signatures vs empty spaces
+    signatures_html = ""
+    
+    for party in contract.parties:
+        party_name = _get_party_display_name(party)
+        party_email = _get_party_email(party)
+        
+        # Check if this party has signed
+        if party_email in signatures_data:
+            signature_info = signatures_data[party_email]
+            signed_at = signature_info['signed_at']
+            
+            # Format the signed date elegantly
+            if isinstance(signed_at, str):
+                from dateutil import parser
+                signed_at = parser.parse(signed_at)
+            
+            formatted_date = signed_at.strftime('%B %d, %Y')
+            
+            # Signed: Show elegant signature with name and date
+            signatures_html += f'''
+            <div class="signature-block signed">
+                <div class="signature-area">
+                    <div class="handwritten-signature">{party_name}</div>
+                    <div class="signature-line"></div>
+                </div>
+                <div class="signature-details">
+                    <div class="signer-name">{party_name}</div>
+                    <div class="signature-date">{formatted_date}</div>
+                </div>
+            </div>
+            '''
+        else:
+            # Not signed: Show elegant blank signature block
+            signatures_html += f'''
+            <div class="signature-block unsigned">
+                <div class="signature-area">
+                    <div class="signature-line"></div>
+                </div>
+                <div class="signature-details">
+                    <div class="signer-name">{party_name}</div>
+                    <div class="signature-date">Date: ______________</div>
+                </div>
+            </div>
+            '''
+    
+    # Create PDF-optimized HTML
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>{contract.title}</title>
+    </head>
+    <body>
+        <div class="header">
+            <div class="title">{contract.title}</div>
+            <div class="effective-date">
+                Effective Date: {contract.effective_date.strftime('%B %d, %Y') if contract.effective_date else 'N/A'}
+            </div>
+            <div class="contract-status">Status: {contract.status.value.title()}</div>
+        </div>
+        
+        <div class="parties">
+            <h3>Parties to this Agreement:</h3>
+            {''.join(f'<div class="party">{_get_party_display_name(party)} ({_get_party_email(party)})</div>' for party in contract.parties)}
+        </div>
+        
+        <div class="content">
+            {sections_html}
+        </div>
+        
+        <div class="signatures">
+            <h3>Signatures:</h3>
+            {signatures_html}
+        </div>
+        
+        {_create_signature_verification_footer(signatures_data)}
+    </body>
+    </html>
+    """
+    
+    return html
+
+
+def _create_signature_verification_footer(signatures_data: Dict[str, Any]) -> str:
+    """Create ultra-discrete verification footer for signed documents."""
+    
+    if not signatures_data:
+        return ""
+    
+    signed_count = len(signatures_data)
+    
+    return f"""
+    <div class="verification-footer">
+        <div class="verification-info">
+            Document authenticated with {signed_count} digital signature{'s' if signed_count != 1 else ''}
+            • Verified {datetime.now(timezone.utc).strftime('%B %Y')} • ContractFlow
+        </div>
+    </div>
+    """
 
 def contract_to_api_response(contract: Contract, content: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
@@ -639,4 +748,126 @@ def contract_to_api_response(contract: Contract, content: Optional[Dict[str, Any
             for party in contract.parties
         ],
         "current_content": content or {}
+    }
+def send_contract_for_signature(db: Session, contract_id: UUID, user_id: UUID) -> Contract:
+    """
+    Send a contract for signature by changing its status to PENDING.
+    This triggers the signature process.
+    
+    Args:
+        db: Database session
+        contract_id: ID of the contract to send for signature
+        user_id: ID of the user sending the contract
+        
+    Returns:
+        Updated contract
+        
+    Raises:
+        ContractNotFoundError: If contract not found
+        ContractPermissionError: If user not authorized
+        ContractStatusError: If contract in invalid status
+        ContractValidationError: If no parties require signatures
+    """
+    
+    contract = db.get(Contract, contract_id)
+    if not contract:
+        raise ContractNotFoundError(f"Contract {contract_id} not found")
+    
+    # Check if user is owner or has permission
+    if contract.owner_id != user_id:
+        raise ContractPermissionError("Only contract owner can send contract for signature")
+    
+    # Check if contract is in valid state
+    if contract.status != ContractStatus.DRAFT:
+        raise ContractStatusError(
+            f"Cannot send contract with status '{contract.status.value}' for signature. "
+            f"Contract must be in DRAFT status."
+        )
+    
+    # Check if there are parties that require signatures
+    parties_requiring_signature = [p for p in contract.parties if p.signature_required]
+    if not parties_requiring_signature:
+        raise ContractValidationError("Contract has no parties requiring signatures")
+    
+    # Update contract status
+    contract.status = ContractStatus.PENDING
+    contract.last_activity = datetime.now(timezone.utc)
+    contract.last_activity_by_id = user_id
+    
+    db.commit()
+    db.refresh(contract)
+    
+    return contract
+
+def get_contract_dashboard_data(db: Session, user_id: UUID) -> Dict[str, Any]:
+    """
+    Get dashboard data for contracts - overview statistics.
+    Optimized version using direct SQL queries instead of loading all contracts.
+    
+    Args:
+        db: Database session  
+        user_id: ID of the user
+        
+    Returns:
+        Dashboard data with contract statistics
+    """
+    now_utc = datetime.now(timezone.utc)
+    thirty_days_ago = now_utc - timedelta(days=30)
+    thirty_days_future = now_utc + timedelta(days=30)
+    
+    # 1. Total contracts count (single query)
+    total_contracts = db.exec(
+        select(func.count(Contract.id)).where(Contract.owner_id == user_id)
+    ).one()
+    
+    # 2. Status breakdown using group by (single optimized query)
+    status_query = select(Contract.status, func.count(Contract.id)).where(
+        Contract.owner_id == user_id
+    ).group_by(Contract.status)
+    
+    status_results = db.exec(status_query).all()
+    status_counts = {status.value: 0 for status in ContractStatus}
+    for status, count in status_results:
+        status_counts[status.value] = count
+    
+    # 3. Recent activity count (optimized query with date filter)
+    recent_contracts_count = db.exec(
+        select(func.count(Contract.id)).where(
+            Contract.owner_id == user_id,
+            Contract.created_at >= thirty_days_ago
+        )
+    ).one()
+    
+    # 4. Contracts expiring soon (only load what we need)
+    expiring_query = select(
+        Contract.id, 
+        Contract.title, 
+        Contract.expiration_date
+    ).where(
+        Contract.owner_id == user_id,
+        Contract.status == ContractStatus.ACTIVE,
+        Contract.expiration_date.is_not(None),
+        Contract.expiration_date <= thirty_days_future
+    ).order_by(Contract.expiration_date).limit(5)
+    
+    expiring_results = db.exec(expiring_query).all()
+    
+    expiring_soon = []
+    for contract_id, title, expiration_date in expiring_results:
+        expiring_date_aware = ensure_timezone_aware(expiration_date)
+        days_until = (expiring_date_aware - now_utc).days if expiring_date_aware else 0
+        
+        expiring_soon.append({
+            "id": str(contract_id),
+            "title": title,
+            "expiration_date": expiration_date.isoformat(),
+            "days_until_expiration": days_until
+        })
+    
+    return {
+        "total_contracts": total_contracts,
+        "status_breakdown": status_counts,
+        "recent_contracts_count": recent_contracts_count,
+        "expiring_soon_count": len(expiring_soon),
+        "expiring_soon": expiring_soon
     }

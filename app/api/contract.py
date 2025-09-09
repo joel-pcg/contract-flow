@@ -1,23 +1,39 @@
 # app/api/contracts.py
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlmodel import Session, select
-from fastapi.responses import HTMLResponse, FileResponse
 import logging
 import os
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse, HTMLResponse
+from sqlmodel import Session, select
 
 from app.core.database import get_session
+from app.core.permission import Permission
 from app.core.security import get_current_user
-from app.models.users import User, UUID
 from app.models.contract import Contract, ContractStatus, ContractVersion
 from app.models.organization import OrganizationUser
+from app.models.users import UUID, User
 from app.schemas.contract import (
-    ContractCreate, ContractRead, ContractDetailRead, ContractUpdate
+    ContractCreate,
+    ContractDetailRead,
+    ContractRead,
+    ContractUpdate,
 )
 from app.services.contract_service import (
-    create_contract, update_contract, get_contract_with_current_content, get_user_contracts, render_contract_html, generate_contract_pdf, contract_to_api_response
+    ContractNotFoundError,
+    ContractPermissionError,
+    ContractStatusError,
+    ContractValidationError,
+    contract_to_api_response,
+    create_contract,
+    generate_contract_pdf,
+    get_contract_data,
+    get_contract_with_current_content,
+    get_user_contracts,
+    update_contract,
 )
-from app.core.permission import Permission
+
+from ..services.contract_service import send_contract_for_signature
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +100,26 @@ def get_contracts(
     
     return contracts
 
+@router.get("/dashboard")
+async def get_contracts_dashboard(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session)
+):
+    """Get contract dashboard data for the current user."""
+    
+    try:
+        from ..services.contract_service import get_contract_dashboard_data
+        
+        dashboard_data = get_contract_dashboard_data(db, current_user.id)
+        return dashboard_data
+        
+    except Exception as e:
+        logger.error(f"Error retrieving dashboard data: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve dashboard data"
+        )
+
 @router.get("/{contract_id}")
 def get_contract_details(
     contract_id: UUID,
@@ -141,14 +177,15 @@ def get_contract_details(
     
     return response
 
-@router.get("/{contract_id}/html", response_class=HTMLResponse)
-def get_contract_html(
+@router.get("/{contract_id}/data")
+def get_contract_display_data(
     contract_id: UUID,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session)
 ):
     """
-    Get contract rendered as HTML.
+    Get contract data for frontend display.
+    Clean API-first approach: Backend provides data, Frontend handles rendering.
     """
     # Check permission
     if not current_user.has_permission(Permission.MANAGES_CONTRACT):
@@ -157,51 +194,56 @@ def get_contract_html(
             detail="Not authorized to view contracts"
         )
     
-    # Get contract with content
-    contract, content = get_contract_with_current_content(db, contract_id)
-    
-    if not contract:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Contract not found"
-        )
-    
-    # Check if user has access to this contract
-    # 1. User is owner
-    if contract.owner_id == current_user.id:
-        pass  # User has access
-    # 2. User is a party to the contract
-    elif any(party.user_id == current_user.id for party in contract.parties):
-        pass  # User has access
-    # 3. User has organization permission
-    elif contract.organization_id:
-        org_user_query = select(OrganizationUser).where(
-            OrganizationUser.user_id == current_user.id,
-            OrganizationUser.organization_id == contract.organization_id
-        )
-        org_user = db.exec(org_user_query).first()
+    try:
+        # Get complete contract data using our new optimized function
+        contract_data = get_contract_data(db, contract_id)
         
-        if not (org_user and org_user.role in ["admin", "editor", "viewer"]):
+        # Additional access control check
+        contract = db.get(Contract, contract_id)
+        if not contract:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Contract not found"
+            )
+        
+        # Check if user has access to this contract
+        has_access = False
+        
+        # 1. User is owner
+        if contract.owner_id == current_user.id:
+            has_access = True
+        # 2. User is a party to the contract
+        elif any(party.user_id == current_user.id for party in contract.parties):
+            has_access = True
+        # 3. User has organization permission
+        elif contract.organization_id:
+            org_user_query = select(OrganizationUser).where(
+                OrganizationUser.user_id == current_user.id,
+                OrganizationUser.organization_id == contract.organization_id
+            )
+            org_user = db.exec(org_user_query).first()
+            
+            if org_user and org_user.role in ["admin", "editor", "viewer"]:
+                has_access = True
+        
+        if not has_access:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Not authorized to access this contract"
             )
-    else:
-        # If we get here, user doesn't have access
+        
+        return contract_data
+        
+    except ContractNotFoundError:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to access this contract"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Contract not found"
         )
-    
-    # Render contract as HTML
-    try:
-        html = render_contract_html(content, contract)
-        return HTMLResponse(content=html)
     except Exception as e:
-        logger.error(f"Error rendering contract HTML: {str(e)}")
+        logger.error(f"Error getting contract data: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error rendering contract"
+            detail="Error retrieving contract data"
         )
 
 @router.get("/{contract_id}/pdf", response_class=FileResponse)
@@ -288,7 +330,7 @@ def get_contract_pdf(
                 content['watermark'] = watermark
             
           
-            pdf_path = generate_contract_pdf(content, contract)
+            pdf_path = generate_contract_pdf(content, contract, db)
             
             # Update contract version with PDF path if no watermark
             if not watermark and hasattr(contract, 'versions') and contract.versions:
@@ -317,6 +359,42 @@ def get_contract_pdf(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error generating contract PDF"
+        )
+
+
+@router.post("/{contract_id}/send-for-signature")
+async def send_contract_for_signature_endpoint(
+    contract_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session)
+):
+    """Send a contract for signature by changing status to PENDING."""
+    
+    try:
+      
+        
+        contract = send_contract_for_signature(db, contract_id, current_user.id)
+        
+        # Also send signature request emails
+        from ..services.signature_service import send_signature_request_emails
+        send_signature_request_emails(db, contract_id)
+        
+        return {
+            "message": "Contract sent for signature successfully",
+            "contract_id": str(contract.id),
+            "status": contract.status
+        }
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error sending contract for signature: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send contract for signature"
         )
 
 """

@@ -1,5 +1,7 @@
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import Optional
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -11,7 +13,7 @@ class Settings(BaseSettings):
     PGADMIN_DEFAULT_EMAIL: str
     PGADMIN_DEFAULT_PASSWORD: str
     REDIS_HOST: str
-    REDIS_PORT: str
+    REDIS_PORT: int
 
     SECRET_KEY: str
     ALGORITHM: str
@@ -26,10 +28,18 @@ class Settings(BaseSettings):
     MAIL_SERVER: str
     VERIFICATION_CODE_EXPIRE_HOUR: int = 24
 
+    # Optional Advanced Features (can be in .env but not required)
+    CELERY_BROKER_URL: Optional[str] = None
+    CELERY_RESULT_BACKEND: Optional[str] = None
+    S3_BUCKET_NAME: Optional[str] = None
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    AWS_REGION: Optional[str] = None
+
     class Config:
         env_file = ".env"
 
 
 @lru_cache
 def get_settings():
-    return Settings()
+    return Settings() # type: ignore

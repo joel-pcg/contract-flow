@@ -1,10 +1,18 @@
 
 from .base import TimestampModel
-from .types import OrganizationRole
+from .contract import (
+    Contract,
+    ContractParty,
+    ContractPartyType,
+    ContractStatus,
+    ContractTemplateType,
+    ContractVersion,
+)
 from .invitations import Invitation
 from .organization import Organization, OrganizationUser
+from .signature import ContractSignature
+from .types import OrganizationRole
 from .users import User
-from .contract import Contract, ContractStatus, ContractTemplateType , ContractParty, ContractVersion, ContractPartyType
 
 __all__ = [
     "TimestampModel",
@@ -19,4 +27,5 @@ __all__ = [
     "ContractParty",
     "ContractVersion",
     "ContractPartyType",
+    "ContractSignature",
 ]

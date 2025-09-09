@@ -1,12 +1,16 @@
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
-from sqlmodel import Field, Relationship, Column, JSON
+from typing import TYPE_CHECKING, List, Optional
 from uuid import UUID, uuid4
 
+from sqlmodel import JSON, Column, Field, Relationship
+
 from app.models.base import TimestampModel
-from app.models.users import User
 from app.models.organization import Organization
+from app.models.users import User
+
+if TYPE_CHECKING:
+    from app.models.signature import ContractSignature
 
 
 class ContractStatus(str, Enum):
@@ -52,6 +56,7 @@ class Contract(TimestampModel, table=True):
 
     versions: List['ContractVersion'] = Relationship(back_populates="contract", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
     parties: List['ContractParty'] = Relationship(back_populates="contract", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
+    signatures: List['ContractSignature'] = Relationship(back_populates="contract", sa_relationship_kwargs={"cascade": "all, delete-orphan"})
     current_version: int = Field(default=1)
 
     last_activity_by_id: UUID = Field(foreign_key="user.id")

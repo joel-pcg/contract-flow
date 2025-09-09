@@ -1,46 +1,71 @@
+import logging
+import time
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from sqlmodel import SQLModel
-from .core.database import engine
-from .api.auth import router as auth_router
-from .api.users import router as user_router
-from .api.organizations import router as org_router
-from .api.contract import router as contract_router
 
-app = FastAPI(
-    title="ContractFlow API",
-    description="API for ContractFlow contact management system",
-    version="0.0.1"
+from .api.auth import router as auth_router
+from .api.contract import router as contract_router
+from .api.organizations import router as org_router
+from .api.signatures import router as signatures_router
+from .api.users import router as user_router
+from .core.database import engine
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
+logger = logging.getLogger(__name__)
 
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("🚀 ContractFlow API starting up...")
+    create_db_and_tables()
+    logger.info("✅ Database tables created/verified")
+    yield
+    # Shutdown
+    logger.info("👋 ContractFlow API shutting down...")
+
+
+app = FastAPI(
+    title="ContractFlow API", 
+    description="Professional Contract Management System with advanced features",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
+)
+
+# Security middleware
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['http://localhost:5173', 'http://localhost:8000'],  # Frontend URLs
+    allow_origins=['http://localhost:5173', 'http://localhost:3000'],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Montar archivos estáticos para el frontend (SPA)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
-
-@app.get("/", response_class=HTMLResponse)
-async def get_index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-
-@app.on_event("startup")
-async def on_startup():
-    create_db_and_tables()
+# Request timing middleware
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 
 @app.get("/api/health", tags=['Health Check'])
@@ -51,15 +76,7 @@ app.include_router(auth_router, prefix='/api/auth', tags=['Authentication'])
 app.include_router(user_router, prefix='/api/users', tags=['Users'])
 app.include_router(org_router, prefix='/api/organizations', tags=['Admin Organizations'])
 app.include_router(contract_router, prefix='/api/contracts', tags=['Contracts'])
-
-# Ruta de fallback para SPA - DEBE IR DESPUÉS de todas las otras rutas
-# Esta ruta captura todas las demás rutas que no son ni la raíz ni API
-@app.get("/{full_path:path}", response_class=HTMLResponse)
-async def serve_spa(request: Request, full_path: str):
-
-    if full_path.startswith("api/"):
-        return {"detail": "Not Found"}
-    return templates.TemplateResponse("index.html", {"request": request})
+app.include_router(signatures_router, prefix='/api/contracts', tags=['Contract Signatures'])
 
 if __name__ == "__main__":
     import uvicorn
