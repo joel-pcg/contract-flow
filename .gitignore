@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
-.DS_Store
 alembic/versions/*
 alembic/__pycache__/*
 .cursor/
@@ -36,4 +35,21 @@ ENV/
 *.sqlite
 *.db
 
-storage/
+# Storage and generated files
+storage/contracts/
+*.pdf
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Template files (obsoleted after API refactor)
+templates/
