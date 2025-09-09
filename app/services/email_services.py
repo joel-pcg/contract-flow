@@ -1,10 +1,11 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import secrets
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Optional
+
 from ..core.config import get_settings
 from ..models.organization import OrganizationRole
-from typing import Optional
 
 settings = get_settings()
 
@@ -232,5 +233,120 @@ class EmailService:
             subject=f"Invitación para unirte a {organization_name} en ContractFlow",
             html_content=html_content
         )
+
+    def send_contract_signature_request(self, to_email: str, contract_title: str, contract_id: str, signer_name: str) -> None:
+        """Send email when a contract is sent for signature."""
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid #4A90E2;">
+                    <h2 style="color: #2c3e50; margin-top: 0;">📝 Nuevo Contrato para Firmar</h2>
+                    <p>Hola <strong>{signer_name}</strong>,</p>
+                    
+                    <p>Has recibido un nuevo contrato que requiere tu firma:</p>
+                    
+                    <div style="background: white; padding: 15px; border-radius: 5px; margin: 15px 0; border: 1px solid #e0e0e0;">
+                        <h3 style="color: #4A90E2; margin-top: 0;">"{contract_title}"</h3>
+                        <p style="color: #666; margin-bottom: 0;">ID del Contrato: <code>{contract_id}</code></p>
+                    </div>
+                    
+                    <p><strong>Próximos pasos:</strong></p>
+                    <ol style="padding-left: 20px;">
+                        <li>Inicia sesión en ContractFlow</li>
+                        <li>Ve a "Contratos Pendientes"</li>
+                        <li>Revisa el contrato cuidadosamente</li>
+                        <li>Firma electrónicamente cuando estés listo</li>
+                    </ol>
+                    
+                    <div style="text-align: center; margin: 25px 0;">
+                        <a href="http://localhost:8000/api/docs" 
+                           style="background: #4A90E2; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                            Revisar y Firmar Contrato
+                        </a>
+                    </div>
+                    
+                    <p style="color: #666; font-size: 12px; margin-top: 30px;">
+                        Este email fue enviado desde ContractFlow. Si tienes preguntas, contacta al remitente del contrato.
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+        
+        self._send_email(
+            to_email=to_email,
+            subject=f"📝 Contrato '{contract_title}' requiere tu firma - ContractFlow",
+            html_content=html_content
+        )
+
+    def send_contract_signed_notification(self, to_email: str, contract_title: str, signer_name: str, contract_id: str) -> None:
+        """Send email when a contract is signed by someone."""
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="background: #f8fff8; padding: 20px; border-radius: 8px; border-left: 4px solid #28a745;">
+                    <h2 style="color: #155724; margin-top: 0;">✅ Contrato Firmado</h2>
+                    
+                    <p><strong>{signer_name}</strong> ha firmado el contrato:</p>
+                    
+                    <div style="background: white; padding: 15px; border-radius: 5px; margin: 15px 0; border: 1px solid #d1ecf1;">
+                        <h3 style="color: #28a745; margin-top: 0;">"{contract_title}"</h3>
+                        <p style="color: #666; margin-bottom: 0;">ID del Contrato: <code>{contract_id}</code></p>
+                    </div>
+                    
+                    <p>Puedes revisar el estado del contrato y descargar el PDF firmado desde tu dashboard.</p>
+                    
+                    <div style="text-align: center; margin: 25px 0;">
+                        <a href="http://localhost:8000/api/docs" 
+                           style="background: #28a745; color: white; padding: 12px 25px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                            Ver Dashboard de Contratos
+                        </a>
+                    </div>
+                </div>
+            </body>
+        </html>
+        """
+        
+        self._send_email(
+            to_email=to_email,
+            subject=f"✅ Contrato '{contract_title}' firmado por {signer_name} - ContractFlow",
+            html_content=html_content
+        )
+
+    def send_contract_completed_notification(self, to_email: str, contract_title: str, contract_id: str) -> None:
+        """Send email when all parties have signed a contract."""
+        html_content = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                <div style="background: #fff3cd; padding: 20px; border-radius: 8px; border-left: 4px solid #ffc107;">
+                    <h2 style="color: #856404; margin-top: 0;">🎉 ¡Contrato Completamente Firmado!</h2>
+                    
+                    <p>¡Excelente! Todas las partes han firmado el contrato:</p>
+                    
+                    <div style="background: white; padding: 15px; border-radius: 5px; margin: 15px 0; border: 1px solid #ffeaa7;">
+                        <h3 style="color: #ffc107; margin-top: 0;">"{contract_title}"</h3>
+                        <p style="color: #666;">ID del Contrato: <code>{contract_id}</code></p>
+                        <p style="color: #666; margin-bottom: 0;"><strong>Estado:</strong> <span style="color: #28a745;">ACTIVO</span></p>
+                    </div>
+                    
+                    <p>El contrato está ahora <strong>legalmente vigente</strong>. Puedes descargar el PDF final con todas las firmas desde tu dashboard.</p>
+                    
+                    <div style="text-align: center; margin: 25px 0;">
+                        <a href="http://localhost:8000/api/docs" 
+                           style="background: #ffc107; color: #212529; padding: 12px 25px; text-decoration: none; border-radius: 5px; display: inline-block; font-weight: bold;">
+                            Descargar PDF Final
+                        </a>
+                    </div>
+                </div>
+            </body>
+        </html>
+        """
+        
+        self._send_email(
+            to_email=to_email,
+            subject=f"🎉 ¡Contrato '{contract_title}' completado! - ContractFlow",
+            html_content=html_content
+        )
+
 # Instancia global del servicio
 email_service = EmailService()

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
+from dateutil import parser
 from sqlmodel import Session, func, select
 
 from app.core.permission import ROLE_PERMISSIONS, Permission
@@ -581,13 +582,28 @@ def _create_pdf_html(contract: Contract, content: Dict[str, Any], signatures_dat
     
     # Build sections HTML
     sections_html = ""
-    for section in content.get("sections", []):
-        sections_html += f"""
-        <div class="section">
-            <h2>{section.get('title', 'Section')}</h2>
-            <div class="section-content">{section.get('text', '')}</div>
-        </div>
-        """
+    sections = content.get("sections", {})
+    
+    # Handle both cases: sections as dict or list
+    if isinstance(sections, dict):
+        # If sections is a simple dict, iterate over key-value pairs
+        for section_key, section_value in sections.items():
+            sections_html += f"""
+            <div class="section">
+                <h2>{section_key.replace('_', ' ').title()}</h2>
+                <div class="section-content">{section_value}</div>
+            </div>
+            """
+    elif isinstance(sections, list):
+        # If sections is a list of dicts (original expected format)
+        for section in sections:
+            if isinstance(section, dict):
+                sections_html += f"""
+                <div class="section">
+                    <h2>{section.get('title', 'Section')}</h2>
+                    <div class="section-content">{section.get('text', '')}</div>
+                </div>
+                """
     
     # Build signatures HTML - showing real signatures vs empty spaces
     signatures_html = ""
@@ -603,7 +619,7 @@ def _create_pdf_html(contract: Contract, content: Dict[str, Any], signatures_dat
             
             # Format the signed date elegantly
             if isinstance(signed_at, str):
-                from dateutil import parser
+               
                 signed_at = parser.parse(signed_at)
             
             formatted_date = signed_at.strftime('%B %d, %Y')
@@ -630,7 +646,6 @@ def _create_pdf_html(contract: Contract, content: Dict[str, Any], signatures_dat
                 </div>
                 <div class="signature-details">
                     <div class="signer-name">{party_name}</div>
-                    <div class="signature-date">Date: ______________</div>
                 </div>
             </div>
             '''
@@ -796,7 +811,6 @@ def send_contract_for_signature(db: Session, contract_id: UUID, user_id: UUID) -
     
     db.commit()
     db.refresh(contract)
-    
     return contract
 
 def get_contract_dashboard_data(db: Session, user_id: UUID) -> Dict[str, Any]:

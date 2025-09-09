@@ -1,21 +1,8 @@
-from fastapi import APIRouter, Depends, BackgroundTasks, status, HTTPException
-from sqlmodel import Session, select
 from datetime import datetime, timedelta
 
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from sqlmodel import Session, select
 
-from ..models.users import User
-from ..models.organization import Organization, OrganizationUser, OrganizationRole
-
-from ..schemas.auth import (
-    TokenResponse,
-    RegisterResponse,
-    VerifyEmailRequest,
-    LoginRequest,
-    ResetPassword,
-    ResentVerification
-)
-
-from ..schemas.users import UserCreate
 from ..core.database import get_session, get_settings
 from ..core.security import (
     create_access_token,
@@ -23,9 +10,18 @@ from ..core.security import (
     get_password_hash,
     verify_password,
 )
-
+from ..models.organization import Organization, OrganizationRole, OrganizationUser
+from ..models.users import User
+from ..schemas.auth import (
+    LoginRequest,
+    RegisterResponse,
+    ResentVerification,
+    ResetPassword,
+    TokenResponse,
+    VerifyEmailRequest,
+)
+from ..schemas.users import UserCreate
 from ..services.email_services import email_service
-
 
 router = APIRouter()
 settings = get_settings()
@@ -162,7 +158,7 @@ async def login(login_data: LoginRequest, session: Session = Depends(get_session
 
 @router.post("/resend-verification")
 async def resend_verification(
-    background_task: BackgroundTasks,
+    background_tasks: BackgroundTasks,
     email_verification: ResentVerification,
     session: Session = Depends(get_session),
 ):
@@ -180,10 +176,11 @@ async def resend_verification(
     user.verification_code = verification_code
     user.verification_code_expires = expires
 
-    background_task.add_task(
+    background_tasks.add_task(
         email_service.send_verification_email, email_verification.email, verification_code
     )
     session.commit()
+    
     return {
         "message": "You will receive a new code"
     }

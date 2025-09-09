@@ -3,7 +3,7 @@ import logging
 import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlmodel import Session, select
 
@@ -365,19 +365,34 @@ def get_contract_pdf(
 @router.post("/{contract_id}/send-for-signature")
 async def send_contract_for_signature_endpoint(
     contract_id: UUID,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_session)
 ):
     """Send a contract for signature by changing status to PENDING."""
+    from app.services.email_services import email_service
+    from app.services.signature_service import get_signature_request_emails
     
     try:
-      
-        
+        # Send contract for signature (core business logic)
         contract = send_contract_for_signature(db, contract_id, current_user.id)
         
-        # Also send signature request emails
-        from ..services.signature_service import send_signature_request_emails
-        send_signature_request_emails(db, contract_id)
+        # 🚀 Send signature request emails in background
+        try:
+            email_data = get_signature_request_emails(db, contract_id)
+            if email_data and email_data.get('email_requests'):
+                for email_request in email_data['email_requests']:
+                    background_tasks.add_task(
+                        email_service.send_contract_signature_request,
+                        to_email=email_request['email'],
+                        contract_title=email_data['contract'].title,
+                        contract_id=str(contract_id),
+                        signer_name=email_request['signer_name']
+                    )
+                logger.info(f"Queued {len(email_data['email_requests'])} signature request emails for contract {contract_id}")
+        except Exception as e:
+            logger.warning(f"Failed to queue signature request emails for contract {contract_id}: {str(e)}")
+            # Don't fail the entire operation if email queuing fails
         
         return {
             "message": "Contract sent for signature successfully",
@@ -385,7 +400,7 @@ async def send_contract_for_signature_endpoint(
             "status": contract.status
         }
         
-    except ValueError as e:
+    except (ContractNotFoundError, ContractPermissionError, ContractStatusError, ContractValidationError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e)

@@ -1,12 +1,13 @@
 import logging
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
 from ..core.database import get_session
 from ..core.security import get_current_user
-from ..models.signature import ContractSignature
+
+# from ..models.signature import ContractSignature
 from ..models.users import User
 from ..schemas.signature import ContractSignatureStatus, SignatureCreate, SignatureRead
 from ..services.signature_service import (
@@ -26,6 +27,7 @@ async def sign_contract_endpoint(
     contract_id: str,
     signature_data: SignatureCreate,
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_session)
 ):
     """
@@ -51,6 +53,39 @@ async def sign_contract_endpoint(
             ip_address=client_ip,
             user_agent=user_agent
         )
+        
+      # 🚀 Send email notifications in background after successful signing
+        try:
+            from ..services.email_services import email_service
+            from ..services.signature_service import get_signature_notification_data
+            
+            notification_data = get_signature_notification_data(db, signature.contract_id, signature.party_email)
+            
+            if notification_data and notification_data.get('emails_to_notify'):
+                if notification_data['notification_type'] == 'completed':
+                    # Contract fully signed - notify all parties
+                    for email_addr in notification_data['emails_to_notify']:
+                        background_tasks.add_task(
+                            email_service.send_contract_completed_notification,
+                            to_email=email_addr,
+                            contract_title=notification_data['contract'].title,
+                            contract_id=str(signature.contract_id)
+                        )
+                else:
+                    # Partial signature - notify owner and other parties
+                    for email_addr in notification_data['emails_to_notify']:
+                        background_tasks.add_task(
+                            email_service.send_contract_signed_notification,
+                            to_email=email_addr,
+                            contract_title=notification_data['contract'].title,
+                            signer_name=notification_data['signer_name'],
+                            contract_id=str(signature.contract_id)
+                        )
+                
+                logger.info(f"Queued signature notification emails for contract {signature.contract_id}")
+        except Exception as e:
+            logger.warning(f"Failed to queue signature notification emails: {str(e)}")
+            # Don't fail the signing process if email queuing fails
         
         return SignatureRead(
             id=signature.id,
