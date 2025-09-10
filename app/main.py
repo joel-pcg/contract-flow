@@ -11,6 +11,7 @@ from .api.auth import router as auth_router
 from .api.contract import router as contract_router
 from .api.organizations import router as org_router
 from .api.signatures import router as signatures_router
+from .api.templates import router as templates_router
 from .api.users import router as user_router
 from .core.database import engine
 
@@ -77,6 +78,7 @@ app.include_router(user_router, prefix='/api/users', tags=['Users'])
 app.include_router(org_router, prefix='/api/organizations', tags=['Admin Organizations'])
 app.include_router(contract_router, prefix='/api/contracts', tags=['Contracts'])
 app.include_router(signatures_router, prefix='/api/contracts', tags=['Contract Signatures'])
+app.include_router(templates_router, prefix='/api/templates', tags=['Contract Templates'])
 
 if __name__ == "__main__":
     import uvicorn

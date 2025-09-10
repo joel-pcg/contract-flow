@@ -11,6 +11,7 @@ from .contract import (
 from .invitations import Invitation
 from .organization import Organization, OrganizationUser
 from .signature import ContractSignature
+from .template import ContractTemplate
 from .types import OrganizationRole
 from .users import User
 
@@ -28,4 +29,5 @@ __all__ = [
     "ContractVersion",
     "ContractPartyType",
     "ContractSignature",
+    "ContractTemplate",
 ]

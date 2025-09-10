@@ -37,6 +37,7 @@ ENV/
 
 # Storage and generated files
 storage/contracts/
+postman_collection/
 *.pdf
 
 # macOS
