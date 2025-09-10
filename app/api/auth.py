@@ -22,6 +22,7 @@ from ..schemas.auth import (
 )
 from ..schemas.users import UserCreate
 from ..services.email_services import email_service
+from ..services.organization_settings_service import OrganizationSettingsService
 
 router = APIRouter()
 settings = get_settings()
@@ -145,7 +146,25 @@ async def login(login_data: LoginRequest, session: Session = Depends(get_session
             detail="Please verify your email before logging in",
         )
 
-    access_token = create_access_token({"sub": str(user.id)})
+    # Check if organization requires 2FA
+    if OrganizationSettingsService.requires_2fa(session, user.id):
+        # Check if user has 2FA enabled (for now, we'll assume they don't)
+        # In a real implementation, you'd check user.has_2fa_enabled or similar
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your organization requires 2FA. Please enable 2FA on your account to continue.",
+            headers={"X-Requires-2FA": "true"}
+        )
+
+    # Get organization-specific session timeout
+    session_timeout_minutes = OrganizationSettingsService.get_session_timeout_minutes(
+        session, user.id
+    )
+    
+    access_token = create_access_token(
+        {"sub": str(user.id)}, 
+        expires_minutes=session_timeout_minutes
+    )
     refresh_token = create_refresh_token({"sub": str(user.id)})
 
     return TokenResponse(

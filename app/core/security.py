@@ -1,16 +1,17 @@
-from datetime import datetime, timezone, timedelta
-from jose import jwt, JWTError
-from passlib.context import CryptContext
-from .config import get_settings
-from .database import get_session
-from ..models.users import User, UUID
-from ..models.organization import Organization, OrganizationUser
-from ..services.redis_service import redis_service
-from fastapi import Depends, HTTPException, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlmodel import Session, select
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlmodel import Session, select
+
+from ..models.organization import Organization, OrganizationUser
+from ..models.users import UUID, User
+from ..services.redis_service import redis_service
+from .config import get_settings
+from .database import get_session
 
 settings = get_settings()
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
@@ -25,11 +26,11 @@ def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 
-def create_access_token(data: dict):
+def create_access_token(data: dict, expires_minutes: Optional[int] = None):
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(
-        minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
-    )
+    # Use custom timeout or default
+    minutes = expires_minutes if expires_minutes is not None else settings.ACCESS_TOKEN_EXPIRE_MINUTES
+    expire = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     to_encode.update({"exp": expire, "type": "access"})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 

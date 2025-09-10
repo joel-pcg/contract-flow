@@ -10,6 +10,7 @@ from app.core.permission import ROLE_PERMISSIONS, Permission
 from app.models.contract import Contract, ContractParty, ContractStatus, ContractVersion
 from app.models.organization import OrganizationUser
 from app.schemas.contract import ContractCreate, ContractUpdate, ContractVersionCreate
+from app.services.organization_settings_service import OrganizationSettingsService
 from app.services.pdf_service import generate_pdf
 from app.utils.utils import ensure_timezone_aware
 
@@ -408,6 +409,26 @@ def generate_contract_pdf(content: Dict[str, Any], contract: Contract, db: Sessi
         Path to generated PDF file
     """
     try:
+        # Check storage limits if contract belongs to organization
+        if contract.organization_id and db:
+            # Estimate PDF size (rough estimate: 50KB base + 10KB per section)
+            estimated_size_bytes = 50 * 1024  # Base size
+            if "sections" in content:
+                sections = content["sections"]
+                if isinstance(sections, dict):
+                    estimated_size_bytes += len(sections) * 10 * 1024
+                elif isinstance(sections, list):
+                    estimated_size_bytes += len(sections) * 10 * 1024
+            
+            # Check if organization has enough storage
+            if not OrganizationSettingsService.check_storage_available(
+                db, contract.organization_id, estimated_size_bytes
+            ):
+                settings = OrganizationSettingsService.get_organization_settings(db, contract.organization_id)
+                raise ContractServiceError(
+                    f"Storage limit exceeded. Organization limit: {settings.storage.limit_gb}GB. "
+                    f"Cannot generate PDF (estimated size: {estimated_size_bytes // 1024}KB)"
+                )
         # Get signatures for this contract if db session provided
         signatures_data = {}
         if db:
@@ -559,6 +580,18 @@ def generate_contract_pdf(content: Dict[str, Any], contract: Contract, db: Sessi
             output_path=output_path,
             css_content=css_content
         )
+        
+        # Update storage usage if contract belongs to organization
+        if contract.organization_id and db:
+            import os
+            try:
+                actual_file_size = os.path.getsize(pdf_path)
+                OrganizationSettingsService.add_storage_usage(
+                    db, contract.organization_id, actual_file_size
+                )
+                logger.info(f"Added {actual_file_size} bytes to organization {contract.organization_id} storage")
+            except OSError as e:
+                logger.warning(f"Could not determine file size for {pdf_path}: {e}")
         
         logger.info(f"Contract PDF generated: {pdf_path}")
         return pdf_path
